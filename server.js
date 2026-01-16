@@ -11,6 +11,7 @@ const path = require('path');
 // ==========================================
 // CONFIGURATION
 // ==========================================
+// আপনার দেওয়া MongoDB কানেকশন স্ট্রিং
 const MONGODB_URI = "mongodb+srv://sarwarjahanshohid_db_user:CPlQyNRqiD2CyRNc@cluster0.t1fleow.mongodb.net/?retryWrites=true&w=majority&appName=Cluster0";
 const JWT_SECRET = process.env.JWT_SECRET || "secure_secret_key_500_devices";
 const PORT = process.env.PORT || 3000;
@@ -33,7 +34,7 @@ const UserSchema = new mongoose.Schema({
     password: { type: String, required: true },
     role: { type: String, enum: ['user', 'admin'], default: 'user' },
     isBlocked: { type: Boolean, default: false },
-    devices: [{ type: String }] 
+    devices: [{ type: String }] // Array of MAC Addresses
 });
 
 const DeviceSchema = new mongoose.Schema({
@@ -66,8 +67,8 @@ const app = express();
 app.use(cors());
 app.use(express.json());
 
-// --- FRONTEND SERVING (NEW) ---
-// সার্ভার এখন রুট ফোল্ডার থেকে ফাইল সার্ভ করবে
+// --- FRONTEND SERVING ---
+// সার্ভার এখন রুট ফোল্ডার থেকে ফাইল সার্ভ করবে (index.html সহ)
 app.use(express.static(__dirname));
 
 // কেউ রুট URL হিট করলে index.html দেখাবে
@@ -85,10 +86,12 @@ function getBDTime() {
     };
 }
 
+// --- Helper: Generate Serial ---
 function generateSerialNumber() {
     return `SN-${crypto.randomBytes(4).toString('hex').toUpperCase()}`;
 }
 
+// --- Offline Checker ---
 async function checkOfflineDevices() {
     try {
         const threshold = new Date(Date.now() - OFFLINE_THRESHOLD);
@@ -117,6 +120,8 @@ const authenticate = (req, res, next) => {
 };
 
 // --- ROUTES ---
+
+// Signup
 app.post('/api/auth/signup', async (req, res) => {
     const { name, email, password } = req.body;
     try {
@@ -127,6 +132,7 @@ app.post('/api/auth/signup', async (req, res) => {
     } catch (e) { res.status(400).json({ msg: "Email exists" }); }
 });
 
+// Login
 app.post('/api/auth/login', async (req, res) => {
     const { email, password } = req.body;
     const user = await User.findOne({ email });
@@ -140,12 +146,19 @@ app.post('/api/auth/login', async (req, res) => {
     res.json({ token, user: { name: user.name, email: user.email, role: user.role, devices: user.devices } });
 });
 
+// Add Device
 app.post('/api/device/add', authenticate, async (req, res) => {
     const { macAddress, serialNumber } = req.body;
+    
     let device = await Device.findOne({ macAddress });
     
+    // ডিভাইস আগে সার্ভারে কানেক্ট না হলে অ্যাড করা যাবে না
     if (!device) return res.status(404).json({ msg: "Device not found in server. Connect it first." });
+    
+    // সিরিয়াল নম্বর ভেরিফিকেশন
     if (device.serialNumber !== serialNumber) return res.status(400).json({ msg: "Invalid Serial Number" });
+    
+    // অলরেডি ক্লেইম করা কিনা চেক
     if (device.ownerEmail && device.ownerEmail !== req.user.email) return res.status(400).json({ msg: "Device already claimed" });
 
     device.ownerEmail = req.user.email;
@@ -155,17 +168,20 @@ app.post('/api/device/add', authenticate, async (req, res) => {
     res.json({ msg: "Device Added", macAddress });
 });
 
+// Admin: Get Users
 app.get('/api/admin/users', authenticate, async (req, res) => {
     if (req.user.role !== 'admin') return res.status(403).json({ msg: "Access Denied" });
     res.json(await User.find({}, '-password'));
 });
 
+// Admin: Block/Unblock
 app.post('/api/admin/toggle-block', authenticate, async (req, res) => {
     if (req.user.role !== 'admin') return res.status(403).json({ msg: "Access Denied" });
     await User.findByIdAndUpdate(req.body.userId, { isBlocked: req.body.blockStatus });
     res.json({ msg: "Updated" });
 });
 
+// Admin: Lock Device
 app.post('/api/admin/lock-device', authenticate, async (req, res) => {
     if (req.user.role !== 'admin') return res.status(403).json({ msg: "Access Denied" });
     const { macAddress, lockStatus } = req.body;
@@ -195,12 +211,13 @@ wss.on('connection', (ws) => {
         try {
             const data = JSON.parse(msg);
 
-            // 1. Identify Device
+            // 1. Identify Device (ESP32 First Connect)
             if (data.type === 'identify_device') {
                 const mac = data.macAddress;
                 let deviceDB = await Device.findOne({ macAddress: mac });
                 
                 if (!deviceDB) {
+                    // নতুন ডিভাইস: অটো সিরিয়াল জেনারেট করুন
                     const newSerial = generateSerialNumber();
                     deviceDB = new Device({
                         macAddress: mac,
@@ -211,6 +228,7 @@ wss.on('connection', (ws) => {
                     await deviceDB.save();
                     console.log(`✨ New Device: ${mac} (SN: ${newSerial})`);
                 } else {
+                    // লক চেক
                     if (deviceDB.isLocked) {
                         ws.send(JSON.stringify({ command: "LOCKED_BY_ADMIN" }));
                         return ws.close();
@@ -222,14 +240,15 @@ wss.on('connection', (ws) => {
                 connectedDevices.set(mac, ws);
             }
 
-            // 2. Status Update
+            // 2. Status Update (ESP32)
             else if (data.type === 'statusUpdate') {
                 const p = data.payload;
                 const mac = p.macAddress;
                 
+                // আপডেট লাস্ট সিন
                 await Device.updateOne({ macAddress: mac }, { lastSeen: new Date(), status: 'ONLINE' });
 
-                // Motor Logic
+                // মোটর লজিক ও লগিং
                 if (p.motorStatus === "ON") {
                     if (!activeMotorSessions.has(mac)) activeMotorSessions.set(mac, new Date());
                 } 
@@ -238,6 +257,7 @@ wss.on('connection', (ws) => {
                     if (startTime) {
                         const endTime = new Date();
                         const durationMs = endTime - startTime;
+                        
                         const mins = Math.floor(durationMs / 60000);
                         const secs = Math.floor((durationMs % 60000) / 1000);
                         const bdInfo = getBDTime();
@@ -252,12 +272,13 @@ wss.on('connection', (ws) => {
                     }
                 }
                 
+                // ড্যাশবোর্ডে ব্রডকাস্ট
                 wss.clients.forEach(client => {
                     if (client.readyState === WebSocket.OPEN) client.send(JSON.stringify(data));
                 });
             }
 
-            // 3. Commands
+            // 3. User Commands (Start/Stop)
             else if (data.type === 'command') {
                 const targetMac = data.targetMac;
                 const dev = await Device.findOne({ macAddress: targetMac });
@@ -269,7 +290,7 @@ wss.on('connection', (ws) => {
                 }
             }
             
-            // 4. Get Logs
+            // 4. Get Logs (Dashboard Request)
             else if (data.command === 'GET_LOGS') {
                 const logs = await MotorLog.find({ macAddress: data.macAddress }).sort({ createdAt: -1 }).limit(50);
                 ws.send(JSON.stringify({ type: 'logListUpdate', payload: logs }));
